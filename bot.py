@@ -1,7 +1,7 @@
 import os, json, re
 from datetime import datetime
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -59,26 +59,124 @@ def find_category(text):
                 best, score = cat, len(kw)
     return best
 
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("💰 Сводка", callback_data="summary"),
+         InlineKeyboardButton("📊 Бюджет", callback_data="budget")],
+        [InlineKeyboardButton("🛒 Список покупок", callback_data="shopping"),
+         InlineKeyboardButton("📤 Экспорт", callback_data="export")],
+        [InlineKeyboardButton("📈 Отчёт за неделю", callback_data="report"),
+         InlineKeyboardButton("❓ Помощь", callback_data="help")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("📌 Меню:", reply_markup=reply_markup)
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    data = load_data()
+    user = get_user_data(data, user_id)
+
+    if query.data == "summary":
+        inc = sum(t.get("amount", 0) for t in user["transactions"] if t.get("type") == "Доход")
+        exp = sum(t.get("amount", 0) for t in user["transactions"] if t.get("type") == "Расход")
+        await query.message.reply_text(f"💰 Доходы: {inc:.2f} BYN\n💸 Расходы: {exp:.2f} BYN\n📊 Баланс: {inc - exp:.2f} BYN")
+
+    elif query.data == "budget":
+        ps = user.get("period_start")
+        txns = user["transactions"]
+        if ps:
+            txns = [t for t in txns if t.get("date", "").startswith(ps[:7])]
+        inc = sum(t.get("amount", 0) for t in txns if t.get("type") == "Доход")
+        exp = sum(t.get("amount", 0) for t in txns if t.get("type") == "Расход")
+        cats = {}
+        for t in txns:
+            if t.get("type") == "Расход":
+                cats[t.get("category", "Прочее")] = cats.get(t.get("category", "Прочее"), 0) + t.get("amount", 0)
+        msg = f"📊 Бюджет{' с ' + ps if ps else ' (за всё время)'}:\n💰 Доходы: {inc:.2f} BYN\n💸 Расходы: {exp:.2f} BYN\n📊 Баланс: {inc - exp:.2f} BYN\n"
+        if cats:
+            msg += "\nПо категориям:\n"
+            for c, s in sorted(cats.items(), key=lambda x: x[1], reverse=True):
+                msg += f"  {c}: {s:.2f} BYN\n"
+        await query.message.reply_text(msg)
+
+    elif query.data == "shopping":
+        shopping = data.get("shopping", [])
+        if not shopping:
+            await query.message.reply_text("🛒 Список покупок пуст.\nДобавь: «купить хлеб молоко»")
+        else:
+            items = "\n".join(f"□ {i}" for i in shopping)
+            await query.message.reply_text(f"🛒 Общий список покупок:\n{items}")
+
+    elif query.data == "export":
+        all_txns = []
+        for uid, uinfo in data.get("users", {}).items():
+            uname = f"User {uid}"
+            all_txns.extend({"user": uname, **t} for t in uinfo.get("transactions", []))
+        export = {
+            "export_date": datetime.now().strftime("%d.%m.%Y %H:%M"),
+            "shopping_list": data.get("shopping", []),
+            "transactions_by_user": {uid: uinfo.get("transactions", []) for uid, uinfo in data.get("users", {}).items()},
+            "all_transactions": all_txns,
+        }
+        json_str = json.dumps(export, ensure_ascii=False, indent=2)
+        await query.message.reply_document(
+            document=json_str.encode("utf-8"),
+            filename="finance_export.json",
+            caption="📄 Экспорт: расходы по пользователям + список покупок."
+        )
+
+    elif query.data == "report":
+        txns = user["transactions"]
+        now = datetime.now()
+        week_ago = now.strftime("%d.%m.%Y")
+        week_txns = [t for t in txns if t.get("date", "").startswith(now.strftime("%d.%m.%Y")[:7])]
+        inc = sum(t.get("amount", 0) for t in week_txns if t.get("type") == "Доход")
+        exp = sum(t.get("amount", 0) for t in week_txns if t.get("type") == "Расход")
+        cats = {}
+        for t in week_txns:
+            if t.get("type") == "Расход":
+                cats[t.get("category", "Прочее")] = cats.get(t.get("category", "Прочее"), 0) + t.get("amount", 0)
+        msg = f"📈 Отчёт за период:\n💰 Доходы: {inc:.2f} BYN\n💸 Расходы: {exp:.2f} BYN\n📊 Баланс: {inc - exp:.2f} BYN\n"
+        if cats:
+            msg += "\nПо категориям:\n"
+            for c, s in sorted(cats.items(), key=lambda x: x[1], reverse=True):
+                pct = (s / exp * 100) if exp > 0 else 0
+                msg += f"  {c}: {s:.2f} BYN ({pct:.0f}%)\n"
+        msg += f"\n💡 Топливо: {cats.get('Транспорт', 0):.2f} BYN"
+        if exp > 0:
+            daily = exp / max(len(week_txns), 1)
+            msg += f"\n📉 Средний чек: {daily:.2f} BYN"
+        await query.message.reply_text(msg)
+
+    elif query.data == "help":
+        await query.message.reply_text(
+            "📖 Команды:\n\n"
+            "Расходы: «хлеб 55 магнит»\n"
+            "Доходы: «зарплата 2832»\n"
+            "Список: «купить хлеб» / «список» / «купил хлеб»\n"
+            "«сводка» / «бюджет» / «начать месяц»\n"
+            "«/menu» — меню кнопок\n"
+            "«/export» — скачать данные"
+        )
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Я общий финансовый помощник.\n\n"
-        "Расходы: «хлеб 55 магнит»\n"
-        "Доходы: «зарплата 2832»\n"
-        "Список покупок (общий): «купить хлеб молоко»\n"
-        "Команды: сводка, бюджет, список, купил, /export, начать месяц")
+        "Привет! Я финансовый помощник.\n\n"
+        "Пиши расходы: «хлеб 55 магнит»\n"
+        "Или нажми /menu для меню кнопок"
+    )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
     data = load_data()
 
-    # ---- Shopping: starts with "купить" ----
     if text.lower().startswith("купить"):
         items_raw = text[6:].strip()
-        # Allow colon after "купить"
         if items_raw.startswith(":"):
             items_raw = items_raw[1:].strip()
-        # Split by whitespace and remove empty + strip commas
         items = [i.strip(",.") for i in items_raw.split() if i.strip(",.")]
         if not items:
             await update.message.reply_text("Что купить? Пример: «купить хлеб молоко»")
@@ -86,8 +184,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         shopping = data.get("shopping", [])
         added = []
         for item in items:
-            item_lower = item.lower()
-            if item_lower not in [i.lower() for i in shopping]:
+            if item.lower() not in [i.lower() for i in shopping]:
                 shopping.append(item)
                 added.append(item)
         data["shopping"] = shopping
@@ -98,16 +195,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Это уже есть в списке!")
         return
 
-    # ---- Shopping: "купил ..." ----
     if text.lower().startswith("купил"):
         target = text[6:].strip().lower()
         shopping = data.get("shopping", [])
-        if target in ("всё", "все"):
+        if target == "всё":
             data["shopping"] = []
             save_data(data)
             await update.message.reply_text("✅ Всё куплено! Список пуст.")
             return
-        # Match and remove (case insensitive)
         found = None
         for item in shopping:
             if item.lower() == target:
@@ -117,15 +212,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             shopping.remove(found)
             data["shopping"] = shopping
             save_data(data)
+            reply = f"✅ Купил: {found}"
             if shopping:
-                await update.message.reply_text(f"✅ Купил: {found}\n🛒 Осталось: {', '.join(shopping)}")
+                reply += f"\n🛒 Осталось: {', '.join(shopping)}"
             else:
-                await update.message.reply_text(f"✅ Купил: {found}. Список пуст!")
+                reply += "\nСписок пуст!"
+            await update.message.reply_text(reply)
         else:
             await update.message.reply_text(f"«{target}» нет в списке.")
         return
 
-    # ---- "список" ----
     if text.lower() == "список":
         shopping = data.get("shopping", [])
         if not shopping:
@@ -135,7 +231,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"🛒 Общий список покупок:\n{items}")
         return
 
-    # ---- "сводка" / "баланс" / "итоги" ----
     if text.lower() in ("сводка", "баланс", "итоги"):
         user = get_user_data(data, user_id)
         inc = sum(t.get("amount", 0) for t in user["transactions"] if t.get("type") == "Доход")
@@ -143,7 +238,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"💰 Доходы: {inc:.2f} BYN\n💸 Расходы: {exp:.2f} BYN\n📊 Баланс: {inc - exp:.2f} BYN")
         return
 
-    # ---- "бюджет" ----
     if text.lower() == "бюджет":
         user = get_user_data(data, user_id)
         ps = user.get("period_start")
@@ -164,7 +258,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg)
         return
 
-    # ---- "начать месяц" ----
     if text.lower() == "начать месяц":
         user = get_user_data(data, user_id)
         user["period_start"] = datetime.now().strftime("%d.%m.%Y %H:%M")
@@ -173,10 +266,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Новый отчётный период начат! Твои данные обнулены.")
         return
 
-    # ---- Regular expense/income ----
     parsed = parse_message(text)
     if parsed["amount"] == 0:
-        await update.message.reply_text("Не понял сумму. Пример: «хлеб 55»")
+        await update.message.reply_text("Не понял сумму. Пример: «хлеб 55»\nИли /menu")
         return
     cat = find_category(text)
     byn = parsed["amount"]
@@ -198,12 +290,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = load_data()
-    users_info = {}
     all_txns = []
     for uid, uinfo in data.get("users", {}).items():
         uname = f"User {uid}"
         all_txns.extend({"user": uname, **t} for t in uinfo.get("transactions", []))
-    
     export = {
         "export_date": datetime.now().strftime("%d.%m.%Y %H:%M"),
         "shopping_list": data.get("shopping", []),
@@ -211,16 +301,14 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "all_transactions": all_txns,
     }
     json_str = json.dumps(export, ensure_ascii=False, indent=2)
-    await update.message.reply_document(
-        document=json_str.encode("utf-8"),
-        filename="finance_export.json",
-        caption="📄 Экспорт: расходы по пользователям + общий список покупок."
-    )
+    await update.message.reply_document(document=json_str.encode("utf-8"), filename="finance_export.json", caption="📄 Экспорт")
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu))
     app.add_handler(CommandHandler("export", export_command))
+    app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Bot started!")
     app.run_polling()
