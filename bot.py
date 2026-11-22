@@ -3,9 +3,13 @@ from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-BOT_TOKEN = "9011605353:AAG5aRprJNGtWMkfrIMt7GR4X9KD30yTQEw"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    print("ERROR: BOT_TOKEN not set. Add it in Railway Variables!")
+    exit(1)
+
 USD_RATE = 3.0
-DATA_FILE = os.path.expanduser("~/finance_bot_data.json")
+DATA_FILE = "finance_bot_data.json"
 
 def load_data():
     if os.path.exists(DATA_FILE):
@@ -54,8 +58,8 @@ def find_category(text):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я твой финансовый помощник.\n"
-        "Пиши расходы, например: «хлеб 55 магнит»\n"
-        "Или «сводка» для отчёта."
+        "Пиши расходы: «хлеб 55 магнит»\n"
+        "Команды: «сводка», «баланс»"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
