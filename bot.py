@@ -5,7 +5,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
-    print("ERROR: BOT_TOKEN not set. Add it in Railway Variables!")
+    print("ERROR: BOT_TOKEN not set!")
     exit(1)
 
 USD_RATE = 3.0
@@ -15,7 +15,7 @@ def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, encoding="utf-8") as f:
             return json.load(f)
-    return {"transactions": []}
+    return {"transactions": [], "shopping": [], "period_start": None}
 
 def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -33,14 +33,12 @@ def parse_message(msg):
         msg = msg.replace(m.group(0), "")
     s = re.search(r"(?:в|из|на)\s+([\w\- ]{2,30})", msg)
     shop = s.group(1).strip() if s else ""
-    if s:
-        msg = msg.replace(s.group(0), "")
     return {"type": "Доход" if is_income else "Расход", "amount": amount, "shop": shop, "description": msg.strip(",.").strip()}
 
 CATS = {
     "Продукты": "хлеб молоко мясо овощи фрукты продукты еда магнит пятёрочка".split(),
     "Транспорт": "бензин топливо такси метро автобус проезд азс".split(),
-    "Жильё/Коммуналка": "квартплата свет вода газ аренда жильё коммуналка".split(),
+    "Жильё/Коммуналка": "квартплата свет вода газ аренда жильё".split(),
     "Здоровье": "аптека лекарства врач косметолог массаж".split(),
     "Развлечения": "кино кафе ресторан кофе подписка".split(),
     "Кредиты": "кредит рассрочка".split(),
@@ -55,35 +53,115 @@ def find_category(text):
                 best, score = cat, len(kw)
     return best
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update, context):
     await update.message.reply_text(
-        "Привет! Я твой финансовый помощник.\n"
-        "Пиши расходы: «хлеб 55 магнит»\n"
-        "Команды: «сводка», «баланс»"
-    )
+        "Привет! Я твой финансовый помощник.\n\n"
+        "Расходы: «хлеб 55 магнит»\n"
+        "Доходы: «зарплата 2832»\n"
+        "Список покупок: «купить: хлеб яйца»\n"
+        "Команды: сводка, бюджет, список, купил, /export, начать месяц")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(update, context):
     text = update.message.text.strip()
+
+    # ---- Shopping: "купить: ..." ----
+    if text.lower().startswith("купить:"):
+        items = [i.strip() for i in text[7:].split() if i.strip()]
+        if not items:
+            await update.message.reply_text("Что купить? Пример: «купить: хлеб яйца»")
+            return
+        data = load_data()
+        existing = data.get("shopping", [])
+        for item in items:
+            if item not in existing:
+                existing.append(item)
+        data["shopping"] = existing
+        save_data(data)
+        await update.message.reply_text(f"✅ Добавил: {', '.join(items)}")
+        return
+
+    # ---- Shopping: "купил ..." ----
+    if text.lower().startswith("купил"):
+        item = text[6:].strip().lower()
+        data = load_data()
+        shopping = data.get("shopping", [])
+        if item == "всё":
+            data["shopping"] = []
+            save_data(data)
+            await update.message.reply_text("✅ Всё куплено! Список пуст.")
+            return
+        if item in [i.lower() for i in shopping]:
+            shopping = [i for i in shopping if i.lower() != item]
+            data["shopping"] = shopping
+            save_data(data)
+            if shopping:
+                await update.message.reply_text(f"✅ Вычеркнул: {item}\n🛒 Осталось: {', '.join(shopping)}")
+            else:
+                await update.message.reply_text("✅ Вычеркнул. Список пуст!")
+        else:
+            await update.message.reply_text(f"«{item}» нет в списке. Вот список: {', '.join(shopping) if shopping else 'пуст'}")
+        return
+
+    # ---- "список" ----
+    if text.lower() == "список":
+        data = load_data()
+        shopping = data.get("shopping", [])
+        if not shopping:
+            await update.message.reply_text("🛒 Список покупок пуст.\nДобавь: «купить: хлеб яйца»")
+        else:
+            items = "\n".join(f"□ {i}" for i in shopping)
+            await update.message.reply_text(f"🛒 Список покупок:\n{items}")
+        return
+
+    # ---- "бюджет" ----
+    if text.lower() == "бюджет":
+        data = load_data()
+        period_start = data.get("period_start")
+        txns = data["transactions"]
+        if period_start:
+            period_txns = [t for t in txns if t.get("date", "").startswith(period_start[:7])]
+        else:
+            period_txns = txns
+        inc = sum(t.get("amount", 0) for t in period_txns if t.get("type") == "Доход")
+        exp = sum(t.get("amount", 0) for t in period_txns if t.get("type") == "Расход")
+        cats = {}
+        for t in period_txns:
+            if t.get("type") == "Расход":
+                cats[t.get("category", "Прочее")] = cats.get(t.get("category", "Прочее"), 0) + t.get("amount", 0)
+        msg = f"📊 Бюджет{' с ' + period_start if period_start else ''}:\n💰 Доходы: {inc:.2f} BYN\n💸 Расходы: {exp:.2f} BYN\n📊 Баланс: {inc - exp:.2f} BYN\n"
+        if cats:
+            msg += "\nПо категориям:\n"
+            for c, s in sorted(cats.items(), key=lambda x: x[1], reverse=True):
+                msg += f"  {c}: {s:.2f} BYN\n"
+        await update.message.reply_text(msg)
+        return
+
+    # ---- "сводка" / "баланс" / "итоги" ----
     if text.lower() in ("сводка", "баланс", "итоги"):
         data = load_data()
         inc = sum(t.get("amount", 0) for t in data["transactions"] if t.get("type") == "Доход")
         exp = sum(t.get("amount", 0) for t in data["transactions"] if t.get("type") == "Расход")
-        await update.message.reply_text(
-            f"💰 Доходы: {inc:.2f} BYN\n"
-            f"💸 Расходы: {exp:.2f} BYN\n"
-            f"📊 Баланс: {inc - exp:.2f} BYN"
-        )
+        await update.message.reply_text(f"💰 Доходы: {inc:.2f} BYN\n💸 Расходы: {exp:.2f} BYN\n📊 Баланс: {inc - exp:.2f} BYN")
         return
 
+    # ---- "начать месяц" ----
+    if text.lower() == "начать месяц":
+        data = load_data()
+        data["period_start"] = datetime.now().strftime("%d.%m.%Y %H:%M")
+        data["transactions"] = []
+        data["shopping"] = []
+        save_data(data)
+        await update.message.reply_text("✅ Новый отчётный период начат! Все данные обнулены.")
+        return
+
+    # ---- Regular expense/income ----
     parsed = parse_message(text)
     if parsed["amount"] == 0:
         await update.message.reply_text("Не понял сумму. Пример: «хлеб 55»")
         return
-
     cat = find_category(text)
     byn = parsed["amount"]
     usd = round(byn / USD_RATE, 2)
-
     data = load_data()
     data["transactions"].append({
         "date": datetime.now().strftime("%d.%m.%Y %H:%M"),
@@ -95,19 +173,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "description": parsed["description"],
     })
     save_data(data)
-
     inc = sum(t.get("amount", 0) for t in data["transactions"] if t.get("type") == "Доход")
     exp = sum(t.get("amount", 0) for t in data["transactions"] if t.get("type") == "Расход")
-    await update.message.reply_text(
-        f"✅ Записано!\n"
-        f"{parsed['type']}: {cat}\n"
-        f"{byn:.2f} BYN / {usd:.2f} USD\n"
-        f"Баланс: {inc - exp:.2f} BYN"
+    await update.message.reply_text(f"✅ Записано!\n{parsed['type']}: {cat}\n{byn:.2f} BYN / {usd:.2f} USD\nБаланс: {inc - exp:.2f} BYN")
+
+async def export_command(update, context):
+    data = load_data()
+    json_str = json.dumps(data, ensure_ascii=False, indent=2)
+    await update.message.reply_document(
+        document=json_str.encode("utf-8"),
+        filename="finance_data.json",
+        caption="📄 Экспорт данных. Сохрани файл и пришли мне на почту / скинь в чат."
     )
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("export", export_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Bot started!")
     app.run_polling()
